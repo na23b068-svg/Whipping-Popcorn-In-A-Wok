@@ -15,11 +15,11 @@ from pxr import Gf, UsdGeom, UsdPhysics, UsdShade, PhysxSchema
 # ==============================================================================
 ROBOT_PRIM_PATH = "/World/crx10ial"  # Your FANUC robot prim path
 EE_LINK_NAME = "link_6"                # End-effector link name
-NUM_POPCORN = 30                       # Number of popcorn kernels
+NUM_POPCORN = 15                       # Number of popcorn kernels
 WOK_RADIUS = 0.18                      # Wok radius in meters
 WOK_DEPTH = 0.13                       # Wok depth
 WOK_OFFSET_X = 0.27                    # 27cm offset away from end-effector (18cm + 9cm)
-WOK_OFFSET_Z = -0.10                   # 10cm offset down relative to end-effector
+WOK_OFFSET_Z = 0.00                   # 0cm offset (aligned with end-effector centerline)
 # ==============================================================================
 
 
@@ -48,108 +48,88 @@ def ensure_robot_exists(stage, prim_path=ROBOT_PRIM_PATH):
         return False
 
 
-# 1a. Procedural 3D Solid Wok Dish Mesh (With Contact Padding & Thickness)
-def create_concave_wok_mesh(stage, wok_path: str, radius: float = WOK_RADIUS, depth: float = WOK_DEPTH, thickness: float = 0.005):
-    num_rings = 10
-    num_segments = 24
-    vertices = []
-    face_vertex_counts = []
-    face_vertex_indices = []
+# 1a. Load User's CAD Wok Mesh (With V-HACD and Contact Offsets)
+# 1a. Load User's CAD Wok Mesh (With V-HACD and Contact Offsets)
+async def create_concave_wok_mesh(stage, wok_path: str, radius: float = WOK_RADIUS, depth: float = WOK_DEPTH, thickness: float = 0.005):
+    # Convert Wok.stl to Wok.usd if STL exists and USD is missing (Asynchronously, letting Kit update)
+    import os
+    usd_path = "/home/smeer/Documents/Whipping-Popcorn-In-A-Wok/Wok.usd"
+    stl_path = "/home/smeer/Documents/Whipping-Popcorn-In-A-Wok/Wok.stl"
+    if not os.path.exists(usd_path) and os.path.exists(stl_path):
+        try:
+            import omni.kit.app
+            ext_manager = omni.kit.app.get_app().get_extension_manager()
+            if not ext_manager.is_extension_enabled("omni.kit.asset_converter"):
+                ext_manager.set_extension_enabled_immediate("omni.kit.asset_converter", True)
+            import omni.kit.asset_converter
+            converter = omni.kit.asset_converter.get_instance()
+            task = converter.create_converter_task(stl_path, usd_path, None)
+            success = await task.wait_until_finished()
+            if not success:
+                print(f"[CAD Conversion] Failed to convert: {task.get_error_message()}")
+        except Exception as e:
+            print(f"[CAD Conversion] Warning: Failed to convert Wok.stl to USD: {e}")
 
-    # A. Generate Vertices (Inner & Outer Shells)
-    # Inner Shell (0 to N-1)
-    for i in range(num_rings + 1):
-        v_angle = (i / num_rings) * (np.pi / 2.0)
-        r = radius * np.sin(v_angle)
-        z = depth * (1.0 - np.cos(v_angle))
-        for j in range(num_segments):
-            h_angle = (j / num_segments) * 2.0 * np.pi
-            vertices.append(Gf.Vec3f(float(r * np.cos(h_angle)), float(r * np.sin(h_angle)), float(z)))
+    # Load USD Reference
+    wok_prim = stage.DefinePrim(wok_path, "Xform")
+    wok_prim.GetReferences().ClearReferences()
+    if os.path.exists(usd_path):
+        wok_prim.GetReferences().AddReference(usd_path)
+    else:
+        wok_prim.GetReferences().AddReference(stl_path)
 
-    # Outer Shell (N to 2N-1)
-    for i in range(num_rings + 1):
-        v_angle = (i / num_rings) * (np.pi / 2.0)
-        r = (radius + thickness) * np.sin(v_angle)
-        z = depth * (1.0 - np.cos(v_angle)) - thickness * np.cos(v_angle)
-        for j in range(num_segments):
-            h_angle = (j / num_segments) * 2.0 * np.pi
-            vertices.append(Gf.Vec3f(float(r * np.cos(h_angle)), float(r * np.sin(h_angle)), float(z)))
-
-    N = (num_rings + 1) * num_segments
-
-    # B. Generate Faces
-    # Inner Shell Faces
-    for i in range(num_rings):
-        for j in range(num_segments):
-            next_j = (j + 1) % num_segments
-            idx0 = i * num_segments + j
-            idx1 = i * num_segments + next_j
-            idx2 = (i + 1) * num_segments + next_j
-            idx3 = (i + 1) * num_segments + j
-            face_vertex_counts.append(4)
-            face_vertex_indices.extend([idx0, idx1, idx2, idx3])
-
-    # Outer Shell Faces (Reverse winding for outside-facing normals)
-    for i in range(num_rings):
-        for j in range(num_segments):
-            next_j = (j + 1) % num_segments
-            idx0 = N + i * num_segments + j
-            idx1 = N + i * num_segments + next_j
-            idx2 = N + (i + 1) * num_segments + next_j
-            idx3 = N + (i + 1) * num_segments + j
-            face_vertex_counts.append(4)
-            face_vertex_indices.extend([idx0, idx3, idx2, idx1])
-
-    # Rim Faces (Connect top edges)
-    for j in range(num_segments):
-        next_j = (j + 1) % num_segments
-        idx0 = num_rings * num_segments + j
-        idx1 = num_rings * num_segments + next_j
-        idx2 = N + num_rings * num_segments + next_j
-        idx3 = N + num_rings * num_segments + j
-        face_vertex_counts.append(4)
-        face_vertex_indices.extend([idx0, idx1, idx2, idx3])
-
-    mesh = UsdGeom.Mesh.Define(stage, wok_path)
-    mesh.GetPointsAttr().Set(vertices)
-    mesh.GetFaceVertexCountsAttr().Set(face_vertex_counts)
-    mesh.GetFaceVertexIndicesAttr().Set(face_vertex_indices)
-    mesh.GetDoubleSidedAttr().Set(False)
-    mesh.GetSubdivisionSchemeAttr().Set(UsdGeom.Tokens.bilinear)
-
-    UsdPhysics.CollisionAPI.Apply(mesh.GetPrim())
-    mesh_collision = UsdPhysics.MeshCollisionAPI.Apply(mesh.GetPrim())
+    # Apply Physics Collision
+    UsdPhysics.CollisionAPI.Apply(wok_prim)
+    mesh_collision = UsdPhysics.MeshCollisionAPI.Apply(wok_prim)
     mesh_collision.CreateApproximationAttr().Set(UsdPhysics.Tokens.convexDecomposition)
 
     # PhysX Collision Offsets to prevent kernel penetration/tunneling through decomposition seams
-    physx_collision = PhysxSchema.PhysxCollisionAPI.Apply(mesh.GetPrim())
+    physx_collision = PhysxSchema.PhysxCollisionAPI.Apply(wok_prim)
     physx_collision.CreateContactOffsetAttr().Set(0.02)  # 2cm contact sensing distance
     physx_collision.CreateRestOffsetAttr().Set(0.001)     # 1mm safety padding offset
 
-    return mesh
+    return wok_prim
 
 
-# 1b. Create Wok Handle Cylinder (Connects End-Effector to Wok Outer Rim Only)
-def create_wok_handle(stage, handle_path: str, offset_x: float = WOK_OFFSET_X, wok_radius: float = WOK_RADIUS, handle_radius: float = 0.015, z_offset: float = -WOK_OFFSET_Z):
-    # Length spans from EE flange (-offset_x) to Wok Rim (-wok_radius)
-    length = max(0.02, offset_x - wok_radius)
-    
-    cylinder = UsdGeom.Cylinder.Define(stage, handle_path)
-    cylinder.CreateRadiusAttr().Set(handle_radius)
-    cylinder.CreateHeightAttr().Set(length)
-    cylinder.CreateAxisAttr().Set("X")  # Align cylinder along X-axis
-    
-    # Midpoint between EE Link (-offset_x) and Wok Rim (-wok_radius)
+# 1b. Load User's CAD Handle Cylinder
+async def create_wok_handle(stage, handle_path: str, offset_x: float = WOK_OFFSET_X, wok_radius: float = WOK_RADIUS, handle_radius: float = 0.015, z_offset: float = -WOK_OFFSET_Z):
+    # Convert Handle.stl to Handle.usd if STL exists and USD is missing (Asynchronously, letting Kit update)
+    import os
+    usd_path = "/home/smeer/Documents/Whipping-Popcorn-In-A-Wok/Handle.usd"
+    stl_path = "/home/smeer/Documents/Whipping-Popcorn-In-A-Wok/Handle.stl"
+    if not os.path.exists(usd_path) and os.path.exists(stl_path):
+        try:
+            import omni.kit.app
+            ext_manager = omni.kit.app.get_app().get_extension_manager()
+            if not ext_manager.is_extension_enabled("omni.kit.asset_converter"):
+                ext_manager.set_extension_enabled_immediate("omni.kit.asset_converter", True)
+            import omni.kit.asset_converter
+            converter = omni.kit.asset_converter.get_instance()
+            task = converter.create_converter_task(stl_path, usd_path, None)
+            success = await task.wait_until_finished()
+            if not success:
+                print(f"[CAD Conversion] Failed to convert: {task.get_error_message()}")
+        except Exception as e:
+            print(f"[CAD Conversion] Warning: Failed to convert Handle.stl to USD: {e}")
+
+    # Load USD Reference
+    handle_prim = stage.DefinePrim(handle_path, "Xform")
+    handle_prim.GetReferences().ClearReferences()
+    if os.path.exists(usd_path):
+        handle_prim.GetReferences().AddReference(usd_path)
+    else:
+        handle_prim.GetReferences().AddReference(stl_path)
+
+    # Position handle relative to Wok_Bowl
     midpoint_x = -(offset_x + wok_radius) / 2.0
-    xform = UsdGeom.XformCommonAPI(cylinder.GetPrim())
+    xform = UsdGeom.XformCommonAPI(handle_prim)
     xform.SetTranslate(Gf.Vec3d(midpoint_x, 0.0, z_offset))
-    
-    cylinder.CreateDisplayColorAttr().Set([Gf.Vec3f(0.1, 0.1, 0.1)])
-    return cylinder
+
+    return handle_prim
 
 
 # 2. Attach Wok via FixedJoint & Spawn Popcorn Particles
-def setup_wok_and_popcorn(robot_prim_path=ROBOT_PRIM_PATH, ee_link_name=EE_LINK_NAME, num_popcorn=NUM_POPCORN):
+async def setup_wok_and_popcorn(robot_prim_path=ROBOT_PRIM_PATH, ee_link_name=EE_LINK_NAME, num_popcorn=NUM_POPCORN):
     stage = omni.usd.get_context().get_stage()
 
     # Ensure Robot Arm Exists
@@ -168,6 +148,7 @@ def setup_wok_and_popcorn(robot_prim_path=ROBOT_PRIM_PATH, ee_link_name=EE_LINK_
         "/World/PopcornParticles",            
         "/World/PopcornInstancer",
         "/World/Wok_Bowl",
+        "/World/PopcornGroup",
         f"{ee_path}/WokFixedJoint",
         f"{ee_path}/Wok_Bowl/PopcornGroup",   
         f"{ee_path}/Wok_Bowl"                 
@@ -176,44 +157,27 @@ def setup_wok_and_popcorn(robot_prim_path=ROBOT_PRIM_PATH, ee_link_name=EE_LINK_
         if stage.GetPrimAtPath(path).IsValid():
             omni.kit.commands.execute('DeletePrims', paths=[path])
 
-    # B. Create Wok Bowl as a STANDALONE prim at /World/Wok_Bowl (Isolates material inheritance)
-    wok_path = "/World/Wok_Bowl"
-    create_concave_wok_mesh(stage, wok_path, radius=WOK_RADIUS, depth=WOK_DEPTH)
+    # B. Create Wok Bowl as a child of link_6 (No FixedJoint, integrates into link_6 articulation)
+    wok_path = f"{ee_path}/Wok_Bowl"
+    await create_concave_wok_mesh(stage, wok_path, radius=WOK_RADIUS, depth=WOK_DEPTH)
     wok_prim = stage.GetPrimAtPath(wok_path)
 
-    # Create Wok Handle attaching the end-effector to the wok bowl
+    # Create Wok Handle as a child of Wok_Bowl
     handle_path = f"{wok_path}/Handle"
-    create_wok_handle(stage, handle_path, offset_x=WOK_OFFSET_X, wok_radius=WOK_RADIUS, handle_radius=0.015)
+    await create_wok_handle(stage, handle_path, offset_x=WOK_OFFSET_X, wok_radius=WOK_RADIUS, handle_radius=0.015)
 
-    # Enable Rigid Body & Symmetric CCD on Wok
-    UsdPhysics.RigidBodyAPI.Apply(wok_prim)
-    physx_wok = PhysxSchema.PhysxRigidBodyAPI.Apply(wok_prim)
-    physx_wok.CreateEnableCCDAttr().Set(True)
+    # Apply local translation and 180 degree rotation relative to parent link_6 frame
+    wok_xformable = UsdGeom.Xformable(wok_prim)
+    wok_xformable.ClearXformOpOrder()
+    wok_xformable.AddTranslateOp().Set(Gf.Vec3d(WOK_OFFSET_X, 0.0, WOK_OFFSET_Z))
+    wok_xformable.AddRotateXYZOp().Set(Gf.Vec3f(0.0, 0.0, 180.0))
 
-    # Enable CCD on Robot End-Effector Link as well
+    # Enable CCD on Robot End-Effector Link (which now contains the Wok and Handle shapes)
     physx_ee = PhysxSchema.PhysxRigidBodyAPI.Apply(ee_prim)
     physx_ee.CreateEnableCCDAttr().Set(True)
 
-    # Position Wok relative to end-effector initial world transform
+    # Get end-effector world matrix for popcorn spawning coordinates
     ee_xform_matrix = omni.usd.get_world_transform_matrix(ee_prim)
-    wok_offset_matrix = Gf.Matrix4d().SetTranslate(Gf.Vec3d(WOK_OFFSET_X, 0.0, WOK_OFFSET_Z))
-    final_wok_matrix = wok_offset_matrix * ee_xform_matrix
-
-    wok_xformable = UsdGeom.Xformable(wok_prim)
-    wok_xformable.ClearXformOpOrder()
-    wok_xformable.AddTransformOp().Set(final_wok_matrix)
-
-    # Attach Wok to End-Effector using Physics FixedJoint with explicit local frames
-    joint_path = f"{ee_path}/WokFixedJoint"
-    fixed_joint = UsdPhysics.FixedJoint.Define(stage, joint_path)
-    fixed_joint.CreateBody0Rel().SetTargets([ee_path])
-    fixed_joint.CreateBody1Rel().SetTargets([wok_path])
-    
-    # Author joint frame offsets so PhysX maintains WOK_OFFSET_X and WOK_OFFSET_Z!
-    fixed_joint.CreateLocalPos0Attr().Set(Gf.Vec3f(float(WOK_OFFSET_X), 0.0, float(WOK_OFFSET_Z)))
-    fixed_joint.CreateLocalRot0Attr().Set(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
-    fixed_joint.CreateLocalPos1Attr().Set(Gf.Vec3f(0.0, 0.0, 0.0))
-    fixed_joint.CreateLocalRot1Attr().Set(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
 
     # Apply Physics Material (Zero Bounciness, High Friction)
     material_path = "/World/PopcornMaterial"
@@ -232,13 +196,15 @@ def setup_wok_and_popcorn(robot_prim_path=ROBOT_PRIM_PATH, ee_link_name=EE_LINK_
     popcorn_root = "/World/PopcornParticles"
     stage.DefinePrim(popcorn_root, "Xform")
     
-    kernel_radius = 0.008
+    kernel_radius = 0.025
     spacing = 0.04 # 4cm spacing
     grid_xy = int(np.ceil(np.sqrt(num_popcorn / 4.0)))
     if grid_xy < 5: grid_xy = 5
 
+    popcorn_paths = []
     for i in range(num_popcorn):
         p_path = f"{popcorn_root}/kernel_{i}"
+        popcorn_paths.append(p_path)
         sphere = UsdGeom.Sphere.Define(stage, p_path)
         sphere.CreateRadiusAttr().Set(kernel_radius)
         
@@ -335,22 +301,29 @@ def apply_aesthetics(stage, robot_prim_path):
     grey_mat = create_color_material("/World/Looks/LightGrey", Gf.Vec3f(0.6, 0.6, 0.6), 0.8)
     black_mat = create_color_material("/World/Looks/WokBlack", Gf.Vec3f(0.05, 0.05, 0.05), 0.2)
 
-    # Color Manipulator Orange
+    # Color Manipulator Orange (excluding the Wok Bowl child prim)
     robot_prim = stage.GetPrimAtPath(robot_prim_path)
     if robot_prim.IsValid():
-        mat_api = UsdShade.MaterialBindingAPI.Apply(robot_prim)
-        mat_api.Bind(orange_mat, UsdShade.Tokens.strongerThanDescendants)
+        for child in robot_prim.GetChildren():
+            if child.GetName() == "link_6":
+                # Color only non-wok children of link_6 orange
+                for sub_child in child.GetChildren():
+                    if sub_child.GetName() != "Wok_Bowl":
+                        UsdShade.MaterialBindingAPI.Apply(sub_child).Bind(orange_mat, UsdShade.Tokens.strongerThanDescendants)
+            else:
+                UsdShade.MaterialBindingAPI.Apply(child).Bind(orange_mat, UsdShade.Tokens.strongerThanDescendants)
         
     # Color Wok Black
-    wok_prim = stage.GetPrimAtPath("/World/Wok_Bowl")
+    wok_path = f"{robot_prim_path}/{EE_LINK_NAME}/Wok_Bowl"
+    wok_prim = stage.GetPrimAtPath(wok_path)
     if wok_prim.IsValid():
-        print(f"[DEBUG] Applying Black Material to standalone Wok at {wok_prim.GetPath()}")
+        print(f"[DEBUG] Applying Black Material to parented Wok at {wok_prim.GetPath()}")
         mat_api = UsdShade.MaterialBindingAPI.Apply(wok_prim)
         mat_api.Bind(black_mat, UsdShade.Tokens.strongerThanDescendants)
-        UsdGeom.Mesh(wok_prim).CreateDisplayColorAttr().Set([Gf.Vec3f(0.05, 0.05, 0.05)])
         
     # Color Handle Black
-    handle_prim = stage.GetPrimAtPath("/World/Wok_Bowl/Handle")
+    handle_path = f"{wok_path}/Handle"
+    handle_prim = stage.GetPrimAtPath(handle_path)
     if handle_prim.IsValid():
         mat_api = UsdShade.MaterialBindingAPI.Apply(handle_prim)
         mat_api.Bind(black_mat, UsdShade.Tokens.strongerThanDescendants)
@@ -373,7 +346,7 @@ async def run_wok_simulation_master(prim_path: str = ROBOT_PRIM_PATH, total_seco
         stage = omni.usd.get_context().get_stage()
 
         # Step 1. Setup Scene Geometry & Popcorn (Includes Robot Auto-Spawn)
-        if not setup_wok_and_popcorn(robot_prim_path=prim_path):
+        if not await setup_wok_and_popcorn(robot_prim_path=prim_path):
             return
 
         # Apply Aesthetics
@@ -387,12 +360,14 @@ async def run_wok_simulation_master(prim_path: str = ROBOT_PRIM_PATH, total_seco
                 print("[Physics] Set PhysX simulation rate to 120Hz!")
                 break
 
-        # Step 3. Start Physics Timeline
+        # Step 3. Start Physics Timeline & Wait for USD/PhysX to Compose compound Links
         timeline = omni.timeline.get_timeline_interface()
         if not timeline.is_playing():
             timeline.play()
-            for _ in range(15):
-                await omni.kit.app.get_app().next_update_async()
+            
+        # Always wait 30 frames to allow reference composition and PhysX backend registration
+        for _ in range(30):
+            await omni.kit.app.get_app().next_update_async()
 
         # Step 4. Initialize Robot
         robot = Articulation(prim_path=prim_path, name="fanuc_robot")
