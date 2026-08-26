@@ -279,9 +279,9 @@ def setup_wok_and_popcorn(robot_prim_path=ROBOT_PRIM_PATH, ee_link_name=EE_LINK_
 # 3. Minimum-Jerk S-Curve Position Generator
 def compute_scurve_wok_position(
     sim_time: float, 
-    freq: float = 1.15,                 
+    freq: float = 1.20,                 
     amp_x: float = 0.116,               
-    amp_z: float = 0.025,               
+    amp_z: float = 0.029,               
     amp_pitch: float = np.radians(16),  
     phase_lag_ratio: float = 0.15
 ) -> tuple:
